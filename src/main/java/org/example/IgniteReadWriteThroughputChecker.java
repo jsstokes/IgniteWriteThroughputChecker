@@ -19,6 +19,7 @@ import java.util.HashSet;
 import java.util.Set;
 import java.io.Serializable;
 import java.util.ArrayList;
+
 /**
  * Apache Ignite Performance Testing Utility
  *
@@ -34,13 +35,12 @@ import java.util.ArrayList;
  * - COMPUTE_JOB: Distributed compute jobs
  *
  * Example:
- * java IgniteReadWriteThroughputChecker /path/to/ignite-config.xml POPULATE  REPEATED_AGGREGATE_QUERY
+ * java IgniteReadWriteThroughputChecker config.xml POPULATE SELECT_ONLY
  *
  * Default Settings:
+ * - Table: "Event"
+ * - Duration: 60 seconds
  * - Initial Records: 10,000
- * -  Records per Aggregate: 5
- * - Query Repetitions: 20
- * - Batch Size: 100
  */
 public class IgniteReadWriteThroughputChecker {
     public enum TestMode {
@@ -80,7 +80,6 @@ public class IgniteReadWriteThroughputChecker {
 
     private Ignite initializeIgniteClient(String configFile) {
         Ignition.setClientMode(true);
-
         return Ignition.start(configFile);
     }
 
@@ -211,15 +210,24 @@ public class IgniteReadWriteThroughputChecker {
 
         System.out.println("Executing query " + repetitions + " times...");
 
+        List<Double> executionTimes = new ArrayList<>();
+        int totalRecords = 0;
+
         // Execute and measure each repetition
         for (int i = 0; i < repetitions; i++) {
             long startTime = System.nanoTime();
-            cache.query(query).getAll();
+            List<List<?>> queryResult = cache.query(query).getAll();
             long endTime = System.nanoTime();
 
             double milliseconds = (endTime - startTime) / 1_000_000.0;
+            executionTimes.add(milliseconds);
+            totalRecords += queryResult.size();
+
             System.out.printf("Execution %d: %.2f ms%n", i + 1, milliseconds);
         }
+
+        // Print summary
+        printAggregateQueryResults(executionTimes, totalRecords, repetitions, "Single Aggregate Query");
     }
 
     private void runRepeatedMultiAggregateQuery(int repetitions) {
@@ -239,7 +247,8 @@ public class IgniteReadWriteThroughputChecker {
     }
 
     private void executeWithDirectQueries(List<List<?>> results, int repetitions) {
-        double totalMs = 0;
+        List<Double> executionTimes = new ArrayList<>();
+        int totalRecords = 0;
         Random random = new Random();
 
         for (int i = 0; i < repetitions; i++) {
@@ -254,16 +263,45 @@ public class IgniteReadWriteThroughputChecker {
             long endTime = System.nanoTime();
 
             double milliseconds = (endTime - startTime) / 1_000_000.0;
-            totalMs += milliseconds;
+            executionTimes.add(milliseconds);
+            totalRecords += queryResults.size();
+            totalRecords += queryResults.size();
 
             System.out.printf("Query %d: %.2f ms (aggregate_id: %s, records: %d)%n",
                     i + 1, milliseconds, aggregateId, queryResults.size());
         }
+        printAggregateQueryResults(executionTimes, totalRecords, repetitions, "Multi Aggregate Query");
+    }
 
-        double avgMs = totalMs / repetitions;
-        System.out.printf("%nSummary (Direct Queries):%n");
-        System.out.printf("Total queries: %d%n", repetitions);
-        System.out.printf("Average query time: %.2f ms%n", avgMs);
+    private void printAggregateQueryResults(List<Double> executionTimes, int totalRecords, int repetitions, String testType) {
+        double totalMs = executionTimes.stream().mapToDouble(Double::doubleValue).sum();
+        double avgMs = totalMs / repetitions;  // Calculate average before using it
+
+        double minMs = executionTimes.stream().mapToDouble(Double::doubleValue).min().orElse(0);
+        double maxMs = executionTimes.stream().mapToDouble(Double::doubleValue).max().orElse(0);
+
+        // Calculate standard deviation
+        double variance = executionTimes.stream()
+                .mapToDouble(t -> Math.pow(t - avgMs, 2))
+                .average()
+                .orElse(0.0);
+        double stdDev = Math.sqrt(variance);
+
+        System.out.println("\n==================================================================================");
+        System.out.println("TEST SUMMARY");
+        System.out.println("==================================================================================");
+        System.out.printf("Test Type:           %s%n", testType);
+        System.out.printf("Total Queries:       %d%n", repetitions);
+        System.out.printf("Total Records:       %d%n", totalRecords);
+        System.out.printf("Avg Records/Query:   %.2f%n", (double)totalRecords / repetitions);
+        System.out.println("\nTiming Statistics:");
+        System.out.printf("  Total Time:        %.2f ms%n", totalMs);
+        System.out.printf("  Average Time:      %.2f ms/query%n", avgMs);
+        System.out.printf("  Minimum Time:      %.2f ms%n", minMs);
+        System.out.printf("  Maximum Time:      %.2f ms%n", maxMs);
+        System.out.printf("  Std Deviation:     %.2f ms%n", stdDev);
+        System.out.printf("  Throughput:        %.2f queries/sec%n", 1000.0 / avgMs);
+        System.out.println("==================================================================================");
         System.out.printf("Total time: %.2f ms%n", totalMs);
     }
 
@@ -306,21 +344,39 @@ public class IgniteReadWriteThroughputChecker {
 
     private void printResults(int totalSelects, int totalUpdates, TestMode testMode) {
         System.out.println("\nTest completed!");
+        System.out.println("==================================================================================");
+        System.out.println("TEST SUMMARY");
+        System.out.println("==================================================================================");
+        System.out.printf("Test Mode:           %s%n", testMode);
+        System.out.printf("Test Duration:       %d seconds%n", testDurationSeconds);
 
         if (testMode == TestMode.SELECT_ONLY || testMode == TestMode.CONCURRENT) {
-            System.out.println("==================================================================================");
-            System.out.println("Select operations: " + totalSelects +
-                    " (throughput: " + (totalSelects / testDurationSeconds) + " ops/sec)");
-            System.out.println("==================================================================================");
+            double selectThroughput = (double) totalSelects / testDurationSeconds;
+            System.out.println("\nRead Operations:");
+            System.out.printf("  Total Selects:     %d%n", totalSelects);
+            System.out.printf("  Avg Throughput:    %.2f ops/sec%n", selectThroughput);
+            System.out.printf("  Avg Latency:       %.2f ms/op%n", 1000.0 / selectThroughput);
         }
 
         if (testMode == TestMode.UPDATE_ONLY || testMode == TestMode.CONCURRENT) {
-            System.out.println("==================================================================================");
-            System.out.println("Update operations: " + totalUpdates +
-                    " (throughput: " + (totalUpdates / testDurationSeconds) + " ops/sec)");
-            System.out.println("==================================================================================");
+            double updateThroughput = (double) totalUpdates / testDurationSeconds;
+            System.out.println("\nWrite Operations:");
+            System.out.printf("  Total Updates:     %d%n", totalUpdates);
+            System.out.printf("  Avg Throughput:    %.2f ops/sec%n", updateThroughput);
+            System.out.printf("  Avg Latency:       %.2f ms/op%n", 1000.0 / updateThroughput);
         }
 
+        if (testMode == TestMode.CONCURRENT) {
+            double totalOps = totalSelects + totalUpdates;
+            double totalThroughput = totalOps / testDurationSeconds;
+            System.out.println("\nCombined Statistics:");
+            System.out.printf("  Total Operations:  %d%n", (int)totalOps);
+            System.out.printf("  Avg Throughput:    %.2f ops/sec%n", totalThroughput);
+            System.out.printf("  Avg Latency:       %.2f ms/op%n", 1000.0 / totalThroughput);
+            System.out.printf("  Read/Write Ratio:  %.2f%n", (double)totalSelects / totalUpdates);
+        }
+
+        System.out.println("==================================================================================");
     }
 
     public void close() {
@@ -330,10 +386,16 @@ public class IgniteReadWriteThroughputChecker {
     }
 
     private static void printUsage() {
-        System.out.println("Usage: java IgniteReadWriteThroughputChecker <configFile> [mode1] [mode2] ... [--compute]");
+        System.out.println("Usage: java IgniteReadWriteThroughputChecker <configFile> [mode1] [mode2] ...");
         System.out.println("Available modes: " + Arrays.toString(TestMode.values()));
-        System.out.println("Options:");
-        System.out.println("  --compute    Execute queries using compute jobs");
+        System.out.println("\nTest Modes:");
+        System.out.println("  SELECT_ONLY                    - Test read performance");
+        System.out.println("  UPDATE_ONLY                    - Test write performance");
+        System.out.println("  CONCURRENT                     - Test simultaneous reads/writes");
+        System.out.println("  POPULATE                       - Create and populate test table");
+        System.out.println("  REPEATED_AGGREGATE_QUERY       - Test aggregate query performance");
+        System.out.println("  REPEATED_MULTI_AGGREGATE_QUERY - Test multiple aggregate queries");
+        System.out.println("  COMPUTE_JOB                    - Test distributed compute jobs");
     }
 
     private static Set<TestMode> parseTestModes(String[] args) {
@@ -564,7 +626,7 @@ public class IgniteReadWriteThroughputChecker {
                 }
             }
         } finally {
-//            checker.close();
+            checker.close();
         }
     }
 }
